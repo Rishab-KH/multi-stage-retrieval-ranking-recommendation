@@ -104,6 +104,13 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
     idx2prod = {v: k for k, v in prod2idx.items()}
     idx2user = {v: k for k, v in user2idx.items()}
 
+    products_csv = os.path.join(data_dir, 'products.csv')
+    prod_id_to_name = {}
+    if os.path.exists(products_csv):
+        products_df = pd.read_csv(products_csv, usecols=['product_id', 'product_name'])
+        prod_id_to_name = dict(zip(products_df['product_id'], products_df['product_name']))
+    idx2name = {idx: prod_id_to_name.get(prod_id, str(prod_id)) for prod_id, idx in prod2idx.items()}
+
     print('Loading and preprocessing data...')
     orders, interactions, _ = load_and_merge_data(data_dir)
     interactions = filter_active_users(orders, interactions, min_orders=3)
@@ -145,15 +152,16 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
         recommended_scores = scores_dict[user_idx][:10]
 
         gt_product_ids = [idx2prod.get(idx, idx) for idx in ground_truth_items]
-        rec_product_ids = [idx2prod.get(idx, idx) for idx in recommended_items]
         hits = set(recommended_items) & set(ground_truth_items)
 
         print(f'\nUser {user_id} (idx={user_idx}):')
         print(f'  Ground truth items ({len(ground_truth_items)}): {gt_product_ids[:5]}...')
         print(f'  Recommended items (top 10):')
-        for j, (prod_id, score) in enumerate(zip(rec_product_ids, recommended_scores), 1):
-            hit_marker = ' *HIT*' if recommended_items[j - 1] in ground_truth_items else ''
-            print(f'    {j}. Product {prod_id} (score: {score:.4f}){hit_marker}')
+        for item_idx, score in zip(recommended_items, recommended_scores):
+            prod_id = idx2prod.get(item_idx, item_idx)
+            name = idx2name.get(item_idx, str(item_idx))
+            hit_marker = ' *HIT*' if item_idx in ground_truth_items else ''
+            print(f'    Product {prod_id} {name} (score: {score:.4f}){hit_marker}')
         recall_at_10 = len(hits) / min(10, len(ground_truth_items)) * 100 if ground_truth_items else 0
         print(f'  Hits: {len(hits)} ({recall_at_10:.1f}% recall@10)')
 
