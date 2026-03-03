@@ -18,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from data_processing import (
+from .data_processing import (
     load_and_merge_data,
     load_products,
     filter_active_users,
@@ -33,8 +33,8 @@ from data_processing import (
     get_user_reorder_rates,
     get_user_stats,
 )
-from model import TwoTowerModel
-from evaluate import evaluate_recommendations
+from .model import TwoTowerModel
+from .evaluate import evaluate_recommendations
 
 
 # ---------------------------------------------------------------------------

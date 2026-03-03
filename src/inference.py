@@ -8,15 +8,15 @@ import faiss
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from model import TwoTowerModel
-from data_processing import (
+from .model import TwoTowerModel
+from .data_processing import (
     load_and_merge_data,
     filter_active_users,
     temporal_train_test_split,
     build_mappings,
     interactions_to_indices,
 )
-from evaluate import evaluate_recommendations
+from .evaluate import evaluate_recommendations
 
 
 def resolve_model_dir(model_dir: str | None) -> str:

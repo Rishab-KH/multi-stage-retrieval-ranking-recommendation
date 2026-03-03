@@ -140,21 +140,25 @@ A production-style two-stage retrieval + reranking pipeline built on the [Instac
 
 ```
 instacart_recsys/
+├── src/
+│   ├── __init__.py
+│   ├── model.py                      ← TwoTowerModel (MLP towers + content embeddings)
+│   ├── data_processing.py            ← loading, splitting, content mappings, feature helpers
+│   ├── train.py                      ← end-to-end pipeline
+│   ├── inference.py                  ← load saved model, run retrieval, evaluate
+│   └── evaluate.py                   ← Recall@K, NDCG@K, MRR@K
+├── tests/
+│   └── test_data_preprocessing.py
 ├── data/
 │   ├── orders.csv
 │   ├── order_products__prior.csv
 │   ├── order_products__train.csv
 │   └── products.csv                  ← required for aisle/dept content features
-├── models/
-│   └── version_YYYYMMDD_HHMMSS/
-│       ├── model.pt                  ← best checkpoint (early stopping)
-│       ├── mappings.pt               ← user2idx, prod2idx, content tensors, model config
-│       └── metadata.json             ← hyperparams + eval results
-├── model.py                          ← TwoTowerModel (MLP towers + content embeddings)
-├── data_processing.py                ← loading, splitting, content mappings, feature helpers
-├── train.py                          ← end-to-end pipeline
-├── inference.py                      ← load saved model, run retrieval, evaluate
-└── evaluate.py                       ← Recall@K, NDCG@K, MRR@K
+└── models/
+    └── version_YYYYMMDD_HHMMSS/
+        ├── model.pt                  ← best checkpoint (early stopping)
+        ├── mappings.pt               ← user2idx, prod2idx, content tensors, model config
+        └── metadata.json             ← hyperparams + eval results
 ```
 
 ---
@@ -163,7 +167,7 @@ instacart_recsys/
 
 **Train:**
 ```bash
-python train.py
+python -m src.train
 ```
 
 Key parameters (all have defaults):
@@ -179,7 +183,7 @@ Key parameters (all have defaults):
 
 **Inference on saved model:**
 ```bash
-python inference.py --model_dir ./models/version_YYYYMMDD_HHMMSS
+python -m src.inference --model_dir ./models/version_YYYYMMDD_HHMMSS
 ```
 
 **Experiment tracking:**

@@ -1,4 +1,4 @@
-from data_processing import *
+from src.data_processing import *
 import os
 
 data_dir = 'data'
