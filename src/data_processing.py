@@ -34,9 +34,15 @@ def load_products(data_dir: str = '.') -> pd.DataFrame:
 
 
 def filter_active_users(orders: pd.DataFrame, interactions: pd.DataFrame, min_orders: int = 3):
-    """Keep only users with at least `min_orders` total orders."""
-    user_max = orders.groupby('user_id')['order_number'].max().reset_index()
-    active_users = user_max[user_max['order_number'] >= min_orders]['user_id']
+    """
+    Keep only users with at least `min_orders` distinct orders.
+
+    Uses nunique(order_id) rather than max(order_number) to count orders. max(order_number)
+    only works correctly when order_number is a dense 1-based sequential counter per user
+    (true for Instacart, but fragile in general). Counting unique order_ids is always correct.
+    """
+    user_order_counts = orders.groupby('user_id')['order_id'].nunique()
+    active_users = user_order_counts[user_order_counts >= min_orders].index
     return interactions[interactions['user_id'].isin(active_users)].copy()
 
 
@@ -57,7 +63,12 @@ def temporal_val_split(train_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFra
     """
     From the training split, hold out each user's last order as validation.
     Mirrors the test split logic — no random shuffling, strictly temporal.
-    Users with only one training order are kept in train (val would be empty for them).
+
+    Note: users with exactly one training order will have that order placed in val,
+    leaving their train portion empty. This is expected and handled downstream —
+    the min_orders=3 filter on the full dataset ensures all users reaching this
+    function have at least 2 training orders (test already consumed the last one),
+    so in practice every user retains at least one order in train after this split.
     """
     last = train_df.groupby('user_id')['order_number'].max().rename('last_train_order').reset_index()
     df = train_df.merge(last, on='user_id')
@@ -67,10 +78,12 @@ def temporal_val_split(train_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFra
     return train, val
 
 
-def build_mappings(train: pd.DataFrame, test: pd.DataFrame) -> Tuple[Dict, Dict]:
+def build_mappings(train: pd.DataFrame) -> Tuple[Dict, Dict]:
     """
     Compact integer index mappings for users and products.
-    Product vocabulary built from training only — avoids test leakage.
+    Both vocabularies are built from training data only — avoids test leakage.
+    Test users/products not seen in training will be treated as OOV and dropped
+    by interactions_to_indices(), which reports drop statistics transparently.
     """
     users = pd.Index(train['user_id'].unique()).sort_values()
     user2idx = {u: i for i, u in enumerate(users)}
@@ -122,20 +135,40 @@ def get_item_content_tensors(
 
 def interactions_to_indices(
     df: pd.DataFrame, user2idx: Dict, prod2idx: Dict
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Map raw ids → compact indices. Rows with unknown products are dropped.
     Preserves 'reordered' column when present.
+
+    Returns:
+      df_idx: indexed interactions
+      dropped_stats: transparency metrics for product OOV drops
+        - dropped_rows_count
+        - dropped_unique_products_count
+        - dropped_fraction
     """
     df = df.copy()
+
+    total_rows = len(df)
+    product_idx_mapped = df['product_id'].map(prod2idx)
+    oov_mask = product_idx_mapped.isna()
+    dropped_rows_count = int(oov_mask.sum())
+    dropped_unique_products_count = int(df.loc[oov_mask, 'product_id'].nunique())
+    dropped_fraction = float(dropped_rows_count / total_rows) if total_rows > 0 else 0.0
+
     df['user_idx'] = df['user_id'].map(user2idx)
-    df['product_idx'] = df['product_id'].map(prod2idx)
+    df['product_idx'] = product_idx_mapped
     df = df.dropna(subset=['user_idx', 'product_idx'])
     df['user_idx'] = df['user_idx'].astype(int)
     df['product_idx'] = df['product_idx'].astype(int)
     base_cols = ['user_id', 'order_id', 'order_number', 'product_id', 'user_idx', 'product_idx']
     extra = [c for c in ['reordered'] if c in df.columns]
-    return df[base_cols + extra]
+    dropped_stats = {
+        'dropped_rows_count': dropped_rows_count,
+        'dropped_unique_products_count': dropped_unique_products_count,
+        'dropped_fraction': dropped_fraction,
+    }
+    return df[base_cols + extra], dropped_stats
 
 
 def get_popularity(train: pd.DataFrame, prod2idx: Dict):
@@ -153,8 +186,8 @@ def get_item_reorder_rates(train_indexed: pd.DataFrame, num_items: int) -> np.nd
     if 'reordered' not in train_indexed.columns:
         return rates
     grp = train_indexed.groupby('product_idx')['reordered'].agg(['sum', 'count'])
-    valid = grp[grp['count'] > 0]
-    rates[valid.index.values] = (valid['sum'] / valid['count']).values.astype(np.float32)
+    # groupby().agg() never produces zero-count groups, so no need to filter
+    rates[grp.index.values] = (grp['sum'] / grp['count']).values.astype(np.float32)
     return rates
 
 
@@ -164,8 +197,7 @@ def get_user_reorder_rates(train_indexed: pd.DataFrame, num_users: int) -> np.nd
     if 'reordered' not in train_indexed.columns:
         return rates
     grp = train_indexed.groupby('user_idx')['reordered'].agg(['sum', 'count'])
-    valid = grp[grp['count'] > 0]
-    rates[valid.index.values] = (valid['sum'] / valid['count']).values.astype(np.float32)
+    rates[grp.index.values] = (grp['sum'] / grp['count']).values.astype(np.float32)
     return rates
 
 

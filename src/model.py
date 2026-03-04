@@ -64,6 +64,18 @@ class TwoTowerModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 nn.init.zeros_(m.bias)
 
+    def forward(self, *args, **kwargs):
+        # Two-tower models don't have a single unified forward pass — the towers
+        # must be called independently so item embeddings can be pre-computed and
+        # cached in a FAISS index at serving time. Calling model(x) directly is
+        # intentionally unsupported to make this separation explicit.
+        raise NotImplementedError(
+            "TwoTowerModel does not implement forward(). "
+            "Use forward_user(user_idx) or forward_item(item_idx, aisle_idx, dept_idx) directly. "
+            "At training time, compute logits manually: (user_emb @ item_emb.T) / temperature. "
+            "At inference time, use get_user_embedding() and get_all_item_embeddings() with a FAISS index."
+        )
+
     def forward_user(self, user_idx: torch.LongTensor) -> torch.Tensor:
         x = self.user_emb(user_idx)
         x = self.user_tower(x)

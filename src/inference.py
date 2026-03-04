@@ -3,23 +3,25 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['OMP_NUM_THREADS'] = '1'
 
+from typing import Optional
+
 import torch
 import faiss
-import numpy as np
 import pandas as pd
 from pathlib import Path
+
+# Absolute imports — works both as `python inference.py` and when imported as a package module.
 from .model import TwoTowerModel
 from .data_processing import (
     load_and_merge_data,
     filter_active_users,
     temporal_train_test_split,
-    build_mappings,
     interactions_to_indices,
 )
 from .evaluate import evaluate_recommendations
 
 
-def resolve_model_dir(model_dir: str | None) -> str:
+def resolve_model_dir(model_dir: Optional[str]) -> str:
     """Resolve model directory; auto-pick latest version if not provided."""
     if model_dir:
         candidate = Path(model_dir)
@@ -46,7 +48,9 @@ def load_model_and_mappings(model_dir: str):
     model_path = os.path.join(model_dir, 'model.pt')
     mappings_path = os.path.join(model_dir, 'mappings.pt')
 
-    mappings = torch.load(mappings_path, map_location='cpu')
+    # weights_only=False is required here because mappings.pt contains Python dicts and
+    # tensors serialized together. Only load files you produced yourself from trusted sources.
+    mappings = torch.load(mappings_path, map_location='cpu', weights_only=False)
     user2idx = mappings['user2idx']
     prod2idx = mappings['prod2idx']
     item_aisle = mappings['item_aisle']
@@ -61,17 +65,17 @@ def load_model_and_mappings(model_dir: str):
         emb_dim=cfg['emb_dim'],
         hidden_dim=cfg['hidden_dim'],
     )
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    # weights_only=True is safe here — model.pt contains only tensor weights (state_dict).
+    model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
     model.eval()
 
     return model, user2idx, prod2idx, item_aisle, item_dept
 
 
 def build_faiss_index(model: TwoTowerModel, item_aisle: torch.LongTensor, item_dept: torch.LongTensor):
-    """Build a FAISS inner-product index over all L2-normalized item embeddings."""
+    """Build a FAISS inner-product index over L2-normalized item embeddings (model outputs are already normalized)."""
     with torch.no_grad():
-        item_embs = model.get_all_item_embeddings(item_aisle, item_dept).numpy().astype('float32')
-    faiss.normalize_L2(item_embs)
+        item_embs = model.get_all_item_embeddings(item_aisle, item_dept).detach().cpu().numpy().astype('float32')
     index = faiss.IndexFlatIP(item_embs.shape[1])
     index.add(item_embs)
     return index
@@ -81,8 +85,9 @@ def infer_batch(model: TwoTowerModel, user_indices: list, index, k: int = 20):
     """Retrieve top-k items for a batch of users."""
     user_idx_tensor = torch.tensor(user_indices, dtype=torch.long)
     with torch.no_grad():
-        user_embs = model.get_user_embedding(user_idx_tensor).numpy().astype('float32')
-    faiss.normalize_L2(user_embs)
+        user_embs = model.get_user_embedding(user_idx_tensor).detach().cpu().numpy().astype('float32')
+    # No faiss.normalize_L2 needed here — get_user_embedding() calls F.normalize internally,
+    # so embeddings are already on the unit sphere before FAISS search.
     scores, indices = index.search(user_embs, k)  # FAISS returns (D, I)
     return indices, scores
 
@@ -101,8 +106,8 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
     print(f'Loading model and mappings from: {model_dir}')
     model, user2idx, prod2idx, item_aisle, item_dept = load_model_and_mappings(model_dir)
 
-    idx2prod = {v: k for k, v in prod2idx.items()}
-    idx2user = {v: k for k, v in user2idx.items()}
+    idx2prod = {prod_idx: prod_id for prod_id, prod_idx in prod2idx.items()}
+    idx2user = {user_idx: user_id for user_id, user_idx in user2idx.items()}
 
     products_csv = os.path.join(data_dir, 'products.csv')
     prod_id_to_name = {}
@@ -114,9 +119,9 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
     print('Loading and preprocessing data...')
     orders, interactions, _ = load_and_merge_data(data_dir)
     interactions = filter_active_users(orders, interactions, min_orders=3)
-    train_df, test_df = temporal_train_test_split(interactions)
+    _train_df, test_df = temporal_train_test_split(interactions)
 
-    test_idx = interactions_to_indices(test_df, user2idx, prod2idx)
+    test_idx, _drop_stats = interactions_to_indices(test_df, user2idx, prod2idx)
     test_by_user = test_idx.groupby('user_idx')['product_idx'].apply(list).to_dict()
     test_users = list(test_by_user.keys())
 
@@ -131,13 +136,25 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
     recs = {u: recs_idx[i].tolist() for i, u in enumerate(test_users)}
     scores_dict = {u: recs_scores[i].tolist() for i, u in enumerate(test_users)}
 
-    results = evaluate_recommendations(recs, test_by_user, ks=[10, 20])
+    # Skip users with empty ground truth for metric computation
+    metric_users = [u for u in test_users if len(test_by_user.get(u, [])) > 0]
+    recs_for_metrics = {u: recs[u] for u in metric_users}
+    truths_for_metrics = {u: test_by_user[u] for u in metric_users}
 
-    print('\n' + '=' * 50)
-    print('Overall Retrieval Results:')
-    print('=' * 50)
-    for metric, value in results.items():
-        print(f"  {metric}: {value:.4f}")
+    K_list = [10, 20]
+    if len(metric_users) == 0:
+        print('\nNo users with non-empty ground truth found. Skipping metric evaluation.')
+    else:
+        print(f"Evaluating on {len(metric_users)} users with non-empty ground truth (out of {len(test_users)} total).")
+        results = evaluate_recommendations(recs_for_metrics, truths_for_metrics, ks=K_list)
+
+        print('\nRetrieval Results (Model):')
+        for k in K_list:
+            print(
+                f"Recall@{k}: {results[f'Recall@{k}']:.4f}, "
+                f"NDCG@{k}: {results[f'NDCG@{k}']:.4f}, "
+                f"MRR@{k}: {results[f'MRR@{k}']:.4f}"
+            )
 
     users_to_show = test_users[:num_users] if num_users > 0 else test_users
 
@@ -155,15 +172,14 @@ def main(model_dir=None, data_dir='./data/', k=20, num_users=10):
         hits = set(recommended_items) & set(ground_truth_items)
 
         print(f'\nUser {user_id} (idx={user_idx}):')
-        print(f'  Ground truth items ({len(ground_truth_items)}): {gt_product_ids[:5]}...')
+        print(f'  Ground truth items ({len(ground_truth_items)}): {gt_product_ids[:5]}')
         print(f'  Recommended items (top 10):')
         for item_idx, score in zip(recommended_items, recommended_scores):
             prod_id = idx2prod.get(item_idx, item_idx)
             name = idx2name.get(item_idx, str(item_idx))
             hit_marker = ' *HIT*' if item_idx in ground_truth_items else ''
             print(f'    Product {prod_id} {name} (score: {score:.4f}){hit_marker}')
-        recall_at_10 = len(hits) / min(10, len(ground_truth_items)) * 100 if ground_truth_items else 0
-        print(f'  Hits: {len(hits)} ({recall_at_10:.1f}% recall@10)')
+        print(f'  Hits@10: {len(hits)}')
 
 
 if __name__ == '__main__':

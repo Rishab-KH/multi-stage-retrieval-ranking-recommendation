@@ -1,24 +1,36 @@
 import os
+import sys
+import hashlib
+import json
+import datetime
+import random
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+
+# ── Ensure src/ is on sys.path for multiprocessing spawn compatibility ────
+# On macOS (Python 3.8+), multiprocessing uses "spawn" which re-imports this
+# module in worker processes. Without this, sibling imports like data_processing
+# fail with ModuleNotFoundError.
+_SRC_DIR = Path(__file__).resolve().parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['OMP_NUM_THREADS'] = '1'
-
-import random
-import json
-import datetime
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import faiss
 import mlflow
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.preprocessing import StandardScaler
+# sklearn imported lazily inside train_reranker() — it is only needed when use_scaler=True
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from .data_processing import (
+# Absolute imports so the module can be run directly as `python train.py`
+# or imported as part of a package — both work without modification.
+from data_processing import (
     load_and_merge_data,
     load_products,
     filter_active_users,
@@ -33,8 +45,8 @@ from .data_processing import (
     get_user_reorder_rates,
     get_user_stats,
 )
-from .model import TwoTowerModel
-from .evaluate import evaluate_recommendations
+from model import TwoTowerModel
+from evaluate import evaluate_recommendations, evaluate_orderable_recommendations
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +111,7 @@ def mine_hard_negatives(
     device,
     k: int = 50,
     num_hard: int = 5,
-    sample_frac: float = 0.25,
+    sample_frac: float = 0.15,
 ) -> dict:
     """
     After each epoch: retrieve top-k items per user, exclude known positives,
@@ -113,10 +125,9 @@ def mine_hard_negatives(
     """
     model.eval()
 
-    # Build item index from current embeddings
+    # Build item index from current embeddings (already L2-normalized by model)
     with torch.no_grad():
         item_embs = model.get_all_item_embeddings(item_aisle, item_dept).numpy().astype('float32')
-    faiss.normalize_L2(item_embs)
     index = faiss.IndexFlatIP(item_embs.shape[1])
     index.add(item_embs)
 
@@ -132,7 +143,6 @@ def mine_hard_negatives(
         user_tensor = torch.tensor(batch_users, dtype=torch.long, device=device)
         with torch.no_grad():
             user_emb = model.get_user_embedding(user_tensor).cpu().numpy().astype('float32')
-        faiss.normalize_L2(user_emb)
         _, indices = index.search(user_emb, k + num_hard)
 
         for j, u in enumerate(batch_users):
@@ -157,18 +167,32 @@ def train_pipeline(
     item_dept: torch.LongTensor,
     item_probs: torch.FloatTensor,
     hard_neg_dict: dict = None,
+    user_pos_dict: dict = None,
     temperature: float = 0.07,
-    num_hard_per_user: int = 5,
+    num_hard: int = 5,
+    num_semihard: int = 5,
+    num_random: int = 5,
+    alpha_hard_neg: float = 0.3,
 ) -> float:
     """
     One epoch of training with:
     - In-batch negatives (main loss)
     - Sampling-bias correction (popularity debiasing) on in-batch negatives
-    - Hard negative augmentation (appended to item matrix after first epoch)
+    - Per-user auxiliary loss with negatives from:
+      * hard negatives (hard_neg_dict)
+      * semi-hard negatives (same department as positive item)
+      * random negatives (from item_probs)
     """
     model.train()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
+
+    # Build department -> item indices once per epoch on device
+    unique_depts = torch.unique(item_dept)
+    dept_to_items = {
+        int(d.item()): torch.nonzero(item_dept == d, as_tuple=False).squeeze(1)
+        for d in unique_depts
+    }
 
     for batch in tqdm(dataloader, desc='train', leave=False):
         user_idx, pos_idx = batch
@@ -181,24 +205,8 @@ def train_pipeline(
             pos_idx, item_aisle[pos_idx], item_dept[pos_idx]
         )  # (B, D)
 
-        # --- Hard negatives: augment item matrix ---
-        hard_items = []
-        if hard_neg_dict is not None:
-            for u in user_idx.cpu().numpy():
-                hard_items.extend(hard_neg_dict.get(int(u), [])[:num_hard_per_user])
-            hard_items = list(set(hard_items))  # deduplicate
-
-        if hard_items:
-            hard_tensor = torch.tensor(hard_items, dtype=torch.long, device=device)
-            hard_emb = model.get_item_embedding(
-                hard_tensor, item_aisle[hard_tensor], item_dept[hard_tensor]
-            )
-            all_item_emb = torch.cat([pos_emb, hard_emb], dim=0)  # (B+H, D)
-        else:
-            all_item_emb = pos_emb  # (B, D)
-
-        # --- Logits ---
-        logits = (user_emb @ all_item_emb.t()) / temperature  # (B, B+H)
+        # --- In-batch logits (unchanged retrieval objective) ---
+        logits_inbatch = (user_emb @ pos_emb.t()) / temperature  # (B, B)
 
         # --- Popularity debiasing: sampling-bias correction on in-batch negatives ---
         # Subtract log(q_j) from off-diagonal logits for the in-batch portion.
@@ -207,16 +215,94 @@ def train_pipeline(
         correction = log_probs.unsqueeze(0).expand(B, B)   # (B, B)
         diag_mask = torch.eye(B, device=device, dtype=torch.bool)
         correction = correction.masked_fill(diag_mask, 0.0)
-        if hard_items:
-            H = len(hard_items)
-            correction = torch.cat(
-                [correction, torch.zeros(B, H, device=device)], dim=1
-            )
-        logits = logits - correction
+        logits_inbatch = logits_inbatch - correction
 
-        # --- Loss: diagonal positives ---
+        # --- In-batch loss: diagonal positives ---
         labels = torch.arange(B, device=device)
-        loss = criterion(logits, labels)
+        loss_inbatch = criterion(logits_inbatch, labels)
+
+        # --- Per-user hard-negative loss ---
+        loss_hard = torch.tensor(0.0, device=device)
+        if hard_neg_dict is not None:
+            batch_users = user_idx.detach().cpu().tolist()
+
+            # 1) hard negatives per user from mining dict
+            hard_lists = [hard_neg_dict.get(int(u), [])[:num_hard] for u in batch_users]
+
+            # 2) semi-hard negatives: sample from same department as positive item
+            semi_idx = torch.full((B, num_semihard), -1, dtype=torch.long, device=device)
+            if num_semihard > 0:
+                pos_dept = item_dept[pos_idx]  # (B,)
+                for d in torch.unique(pos_dept):
+                    rows = torch.nonzero(pos_dept == d, as_tuple=False).squeeze(1)
+                    pool = dept_to_items.get(int(d.item()), None)
+                    if pool is None or pool.numel() == 0:
+                        continue
+                    rnd = torch.randint(0, pool.numel(), (rows.numel(), num_semihard), device=device)
+                    semi_idx[rows] = pool[rnd]
+
+            # 3) random negatives from global item distribution
+            rand_idx = torch.full((B, num_random), -1, dtype=torch.long, device=device)
+            if num_random > 0:
+                rand_idx = torch.multinomial(item_probs, num_samples=B * num_random, replacement=True).view(B, num_random)
+
+            # Merge & filter per-user (exclude train positives and current positive)
+            neg_lists = []
+            for i, u in enumerate(batch_users):
+                pos_set = user_pos_dict.get(int(u), set()) if user_pos_dict is not None else set()
+                cur_pos = int(pos_idx[i].item())
+
+                merged = []
+                merged.extend(hard_lists[i])
+                if num_semihard > 0:
+                    merged.extend([int(x) for x in semi_idx[i].tolist() if x >= 0])
+                if num_random > 0:
+                    merged.extend([int(x) for x in rand_idx[i].tolist() if x >= 0])
+
+                # stable dedupe while filtering positives
+                seen = set()
+                filtered = []
+                for it in merged:
+                    if it == cur_pos or it in pos_set or it in seen:
+                        continue
+                    seen.add(it)
+                    filtered.append(it)
+                neg_lists.append(filtered)
+
+            Hmax = max((len(h) for h in neg_lists), default=0)
+
+            if Hmax > 0:
+                hard_idx = torch.full((B, Hmax), -1, dtype=torch.long, device=device)
+                hard_mask = torch.zeros((B, Hmax), dtype=torch.bool, device=device)
+
+                for i, h in enumerate(neg_lists):
+                    if not h:
+                        continue
+                    h_tensor = torch.tensor(h, dtype=torch.long, device=device)
+                    h_len = h_tensor.numel()
+                    hard_idx[i, :h_len] = h_tensor
+                    hard_mask[i, :h_len] = True
+
+                # Safe embedding lookup; padded entries are masked out afterwards.
+                safe_hard_idx = torch.clamp(hard_idx, min=0)
+                hard_emb = model.get_item_embedding(
+                    safe_hard_idx.view(-1),
+                    item_aisle[safe_hard_idx.view(-1)],
+                    item_dept[safe_hard_idx.view(-1)],
+                ).view(B, Hmax, -1)  # (B, Hmax, D)
+
+                hard_logits = (hard_emb * user_emb.unsqueeze(1)).sum(dim=2) / temperature  # (B, Hmax)
+                hard_logits = hard_logits.masked_fill(~hard_mask, -1e9)
+
+                pos_logits = (user_emb * pos_emb).sum(dim=1, keepdim=True) / temperature  # (B, 1)
+                logits_hard = torch.cat([pos_logits, hard_logits], dim=1)  # (B, 1+Hmax)
+
+                valid_rows = hard_mask.any(dim=1)
+                if valid_rows.any():
+                    hard_labels = torch.zeros(valid_rows.sum(), dtype=torch.long, device=device)
+                    loss_hard = criterion(logits_hard[valid_rows], hard_labels)
+
+        loss = loss_inbatch + alpha_hard_neg * loss_hard
 
         optimizer.zero_grad()
         loss.backward()
@@ -323,25 +409,47 @@ def extract_features_with_truth(
     return np.array(features, dtype=np.float32), np.array(labels, dtype=np.int32)
 
 
-def train_reranker(features: np.ndarray, labels: np.ndarray):
-    """Train a calibrated GBM reranker."""
-    print(f'  Scaling features ({len(features)} samples, {features.shape[1]} features)...')
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
+def train_reranker(
+    features: np.ndarray,
+    labels: np.ndarray,
+    group: List[int],
+    use_scaler: bool = False,
+):
+    """Train a LightGBM LambdaRank reranker with per-user query groups."""
+    try:
+        from lightgbm import LGBMRanker
+    except ImportError as e:
+        raise ImportError(
+            "lightgbm is required for reranker training. Install it with: pip install lightgbm"
+        ) from e
 
-    print('  Training GradientBoostingClassifier (n_estimators=100, max_depth=5)...')
-    base_clf = GradientBoostingClassifier(
-        n_estimators=100,
-        max_depth=5,
+    if sum(group) != len(features):
+        raise ValueError(f"Invalid group sizes: sum(group)={sum(group)} != n_samples={len(features)}")
+
+    scaler = None
+    train_x = features
+    if use_scaler:
+        from sklearn.preprocessing import StandardScaler  # lazy import — only needed when use_scaler=True
+        print(f'  Scaling features ({len(features)} samples, {features.shape[1]} features)...')
+        scaler = StandardScaler()
+        train_x = scaler.fit_transform(features)
+
+    print('  Training LGBMRanker (objective=lambdarank, metric=ndcg)...')
+    ranker = LGBMRanker(
+        objective='lambdarank',
+        metric='ndcg',
+        n_estimators=200,
+        learning_rate=0.05,
+        num_leaves=63,
+        min_child_samples=20,
+        subsample=0.8,
+        colsample_bytree=0.8,
         random_state=42,
-        verbose=1,
+        verbosity=1,
     )
-
-    print('  Calibrating with CalibratedClassifierCV (3-fold)...')
-    calibrated_clf = CalibratedClassifierCV(base_clf, method='sigmoid', cv=3)
-    calibrated_clf.fit(features_scaled, labels)
+    ranker.fit(train_x, labels, group=group)
     print('  Reranker training complete.')
-    return scaler, calibrated_clf
+    return scaler, ranker
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +473,14 @@ def save_metadata(version, model_dir, emb_dim, hidden_dim, batch_size, epochs, r
     print(f'Metadata saved to {path}')
 
 
+def is_orderable(item_idx: int, user_idx: int, seed: int = 42, keep_prob: float = 0.85) -> bool:
+    """Deterministic mock orderability by (user, item), simulating fulfillment constraints."""
+    key = f"{seed}|{user_idx}|{item_idx}".encode('utf-8')
+    digest = hashlib.sha256(key).digest()
+    value = int.from_bytes(digest[:8], byteorder='big', signed=False) / float(2**64)
+    return value < keep_prob
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -376,9 +492,13 @@ def main(
     batch_size: int = 4096,
     epochs: int = 8,
     temperature: float = 0.07,
-    num_workers: int = 2,
+    num_workers: int = 4,
     k_retrieve: int = 200,
     seed: int = 42,
+    num_hard: int = 5,
+    num_semihard: int = 5,
+    num_random: int = 5,
+    alpha_hard_neg: float = 0.5,
 ):
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -401,13 +521,25 @@ def main(
     # Temporal validation split (no random shuffling)
     train_df, val_df = temporal_val_split(train_df)
 
-    user2idx, prod2idx = build_mappings(train_df, test_df)
+    user2idx, prod2idx = build_mappings(train_df)
     aisle2idx, dept2idx = build_content_mappings(products)
     item_aisle, item_dept = get_item_content_tensors(prod2idx, aisle2idx, dept2idx, products)
 
-    train_idx = interactions_to_indices(train_df, user2idx, prod2idx)
-    val_idx = interactions_to_indices(val_df, user2idx, prod2idx)
-    test_idx = interactions_to_indices(test_df, user2idx, prod2idx)
+    train_idx, train_drop_stats = interactions_to_indices(train_df, user2idx, prod2idx)
+    val_idx, val_drop_stats = interactions_to_indices(val_df, user2idx, prod2idx)
+    test_idx, test_drop_stats = interactions_to_indices(test_df, user2idx, prod2idx)
+    train_user_pos = train_idx.groupby('user_idx')['product_idx'].apply(lambda s: set(s.tolist())).to_dict()
+
+    print(
+        f"OOV drops (val): rows={val_drop_stats['dropped_rows_count']} "
+        f"unique_products={val_drop_stats['dropped_unique_products_count']} "
+        f"fraction={val_drop_stats['dropped_fraction']:.6f}"
+    )
+    print(
+        f"OOV drops (test): rows={test_drop_stats['dropped_rows_count']} "
+        f"unique_products={test_drop_stats['dropped_unique_products_count']} "
+        f"fraction={test_drop_stats['dropped_fraction']:.6f}"
+    )
 
     num_users = len(user2idx)
     num_items = len(prod2idx)
@@ -434,9 +566,24 @@ def main(
     # Model training
     # ------------------------------------------------------------------
     dataset = InteractionDataset(train_idx)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
     val_dataset = InteractionDataset(val_idx)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     model = TwoTowerModel(
         num_users=num_users,
@@ -461,7 +608,8 @@ def main(
     hard_neg_dict = None  # populated after epoch 1
 
     mlflow.set_experiment('Two-Tower Recsys')
-    with mlflow.start_run():
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
         mlflow.log_params({
             'embedding_dim': emb_dim,
             'hidden_dim': hidden_dim,
@@ -469,7 +617,13 @@ def main(
             'epochs': epochs,
             'temperature': temperature,
             'patience': patience,
+            'num_hard': num_hard,
+            'num_semihard': num_semihard,
+            'num_random': num_random,
+            'alpha_hard_neg': alpha_hard_neg,
         })
+        mlflow.log_metric('oov_val_dropped_fraction', val_drop_stats['dropped_fraction'])
+        mlflow.log_metric('oov_test_dropped_fraction', test_drop_stats['dropped_fraction'])
 
         epoch_bar = tqdm(range(1, epochs + 1), desc='Epochs', unit='epoch')
         for epoch in epoch_bar:
@@ -479,7 +633,12 @@ def main(
                 item_dept=item_dept,
                 item_probs=item_probs,
                 hard_neg_dict=hard_neg_dict,
+                user_pos_dict=train_user_pos,
                 temperature=temperature,
+                num_hard=num_hard,
+                num_semihard=num_semihard,
+                num_random=num_random,
+                alpha_hard_neg=alpha_hard_neg,
             )
 
             val_loss = compute_val_loss(
@@ -505,14 +664,16 @@ def main(
                     tqdm.write('Early stopping triggered.')
                     break
 
-            # Mine hard negatives for next epoch (start after epoch 1 when model has signal)
-            tqdm.write('  Mining hard negatives...')
-            hard_neg_dict = mine_hard_negatives(
-                model, train_idx, item_aisle, item_dept, device, k=50, num_hard=5
-            )
+            # Mine hard negatives every 2 epochs (expensive FAISS search)
+            if epoch % 2 == 0:
+                tqdm.write('  Mining hard negatives...')
+                hard_neg_dict = mine_hard_negatives(
+                    model, train_idx, item_aisle, item_dept, device, k=50, num_hard=5
+                )
 
     # Reload best checkpoint
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # weights_only=True: model.pt contains only tensor weights (state_dict) — safe to restrict.
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
     # Save mappings (includes content info for inference)
@@ -541,7 +702,7 @@ def main(
     print('Building FAISS index...')
     with torch.no_grad():
         item_embs = model.get_all_item_embeddings(item_aisle, item_dept).numpy().astype('float32')
-    faiss.normalize_L2(item_embs)
+    # Model outputs are already L2-normalized
     index = build_faiss_index(item_embs)
     print(f'Index built. Item embedding shape: {item_embs.shape}')
 
@@ -554,7 +715,7 @@ def main(
     with torch.no_grad():
         test_user_tensor = torch.tensor(test_users, dtype=torch.long, device=device)
         test_user_embs = model.get_user_embedding(test_user_tensor).cpu().numpy().astype('float32')
-    faiss.normalize_L2(test_user_embs)
+    # No faiss.normalize_L2 needed — get_user_embedding() calls F.normalize internally.
 
     K_list = [10, 20]
     # Retrieve a wide candidate pool — reranker selects from all k_retrieve items.
@@ -565,6 +726,12 @@ def main(
     truths = test_by_user
 
     results = evaluate_recommendations(recs, truths, ks=K_list)
+    retrieval_orderable_results = evaluate_orderable_recommendations(
+        recs,
+        truths,
+        is_orderable=lambda item_idx, user_idx: is_orderable(item_idx, user_idx, seed=seed),
+        ks=K_list,
+    )
 
     # Popularity baseline
     pop_series_sorted = train_idx['product_idx'].value_counts()
@@ -578,13 +745,14 @@ def main(
     print('\nTraining reranker on validation users (no leakage from test)...')
 
     val_by_user = val_idx.groupby('user_idx')['product_idx'].apply(list).to_dict()
-    val_users = [u for u in val_by_user.keys() if u in user2idx.values()]
+    valid_user_set = set(user2idx.values())
+    val_users = [u for u in val_by_user.keys() if u in valid_user_set]
 
     # Retrieve candidates for val users
     with torch.no_grad():
         val_user_tensor = torch.tensor(val_users, dtype=torch.long, device=device)
         val_user_embs = model.get_user_embedding(val_user_tensor).cpu().numpy().astype('float32')
-    faiss.normalize_L2(val_user_embs)
+    # No faiss.normalize_L2 needed — get_user_embedding() calls F.normalize internally.
     val_recs_idx, val_recs_scores = retrieve_topk(index, val_user_embs, k=k_retrieve)
     val_user_to_row = {u: i for i, u in enumerate(val_users)}
 
@@ -608,7 +776,16 @@ def main(
     pos_rate = train_labels.mean()
     print(f'  Positive label rate in reranker training: {pos_rate:.4f} ({len(train_feat)} samples)')
 
-    scaler, reranker = train_reranker(train_feat, train_labels)
+    train_group = [len(val_recs_idx[val_user_to_row[u]]) for u in val_users]
+    if any(g != k_retrieve for g in train_group):
+        print('  Warning: some reranker groups differ from k_retrieve.')
+
+    scaler, reranker = train_reranker(
+        train_feat,
+        train_labels,
+        group=train_group,
+        use_scaler=False,
+    )
 
     # Rerank test users (no leakage: reranker never saw test ground truth)
     reranked_recs = {}
@@ -618,6 +795,15 @@ def main(
         sims = recs_scores[row_i]
         hist = train_user_hist.get(u, set())
 
+        import pandas as pd
+        feature_names = [
+            "sim_score",
+            "log_pop",
+            "history_flag",
+            "item_reorder_rate",
+            "log_user_order_count",
+            "log_user_hist_size",
+        ]
         item_features = np.array([
             [
                 float(sims[i]),
@@ -630,12 +816,20 @@ def main(
             for i in range(len(items))
         ], dtype=np.float32)
 
-        item_features_scaled = scaler.transform(item_features)
-        scores = reranker.predict_proba(item_features_scaled)[:, 1]
+        if scaler is not None:
+            item_features = scaler.transform(item_features)
+        item_features_df = pd.DataFrame(item_features, columns=feature_names)
+        scores = reranker.predict(item_features_df)
         order = np.argsort(-scores)
         reranked_recs[u] = items[order].tolist()
 
     rerank_results = evaluate_recommendations(reranked_recs, truths, ks=K_list)
+    rerank_orderable_results = evaluate_orderable_recommendations(
+        reranked_recs,
+        truths,
+        is_orderable=lambda item_idx, user_idx: is_orderable(item_idx, user_idx, seed=seed),
+        ks=K_list,
+    )
 
     # ------------------------------------------------------------------
     # Print results
@@ -644,6 +838,13 @@ def main(
     for k in K_list:
         print(f"  Recall@{k}: {results[f'Recall@{k}']:.4f}  NDCG@{k}: {results[f'NDCG@{k}']:.4f}  MRR@{k}: {results[f'MRR@{k}']:.4f}")
 
+    print('\nInventory-Constrained Retrieval Results (Two-Tower — all test users):')
+    for k in K_list:
+        print(
+            f"  OrderableRecall@{k}: {retrieval_orderable_results[f'OrderableRecall@{k}']:.4f}  "
+            f"OrderableRate@{k}: {retrieval_orderable_results[f'OrderableRate@{k}']:.4f}"
+        )
+
     print('\nPopularity Baseline (all test users):')
     for k in K_list:
         print(f"  Recall@{k}: {pop_results[f'Recall@{k}']:.4f}  NDCG@{k}: {pop_results[f'NDCG@{k}']:.4f}  MRR@{k}: {pop_results[f'MRR@{k}']:.4f}")
@@ -651,6 +852,22 @@ def main(
     print(f'\nReranked Results (all test users, reranker trained on val):')
     for k in K_list:
         print(f"  Recall@{k}: {rerank_results[f'Recall@{k}']:.4f}  NDCG@{k}: {rerank_results[f'NDCG@{k}']:.4f}  MRR@{k}: {rerank_results[f'MRR@{k}']:.4f}")
+
+    print('\nInventory-Constrained Reranked Results (all test users):')
+    for k in K_list:
+        print(
+            f"  OrderableRecall@{k}: {rerank_orderable_results[f'OrderableRecall@{k}']:.4f}  "
+            f"OrderableRate@{k}: {rerank_orderable_results[f'OrderableRate@{k}']:.4f}"
+        )
+
+    with mlflow.start_run(run_id=run_id):
+        def sanitize_metric_name(name):
+            return name.replace("@", "_")
+        for k in K_list:
+            mlflow.log_metric(sanitize_metric_name(f"retrieval_orderable_recall@{k}"), retrieval_orderable_results[f"OrderableRecall@{k}"])
+            mlflow.log_metric(sanitize_metric_name(f"retrieval_orderable_rate@{k}"), retrieval_orderable_results[f"OrderableRate@{k}"])
+            mlflow.log_metric(sanitize_metric_name(f"rerank_orderable_recall@{k}"), rerank_orderable_results[f"OrderableRecall@{k}"])
+            mlflow.log_metric(sanitize_metric_name(f"rerank_orderable_rate@{k}"), rerank_orderable_results[f"OrderableRate@{k}"])
 
     save_metadata(
         version=version,
