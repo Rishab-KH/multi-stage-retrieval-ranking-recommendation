@@ -1,0 +1,11 @@
+[project]
+name = "instacart-recsys"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src", "api", "rag_agent"]

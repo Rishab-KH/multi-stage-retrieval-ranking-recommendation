@@ -11,6 +11,7 @@ A production-grade grocery recommendation platform combining a **two-tower neura
 - [Stage 2 — RAG Policy-Compliance Agent](#stage-2--rag-policy-compliance-agent)
 - [End-to-End Pipeline Flow](#end-to-end-pipeline-flow)
 - [Experiment Results](#experiment-results)
+- [API & Streamlit UI](#api--streamlit-ui)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
 - [Key Design Decisions](#key-design-decisions)
@@ -257,6 +258,47 @@ All results are reported on a held-out test set of 206,209 users.
 
 ---
 
+## API & Streamlit UI
+
+The serving layer exposes the full pipeline as a REST API (FastAPI + uvicorn) with an interactive Streamlit demo frontend.
+
+### Architecture
+
+```
+┌──────────────────┐       HTTP        ┌──────────────────────────────────┐
+│  Streamlit UI    │ ──────────────►   │  FastAPI Backend (uvicorn)       │
+│  localhost:8501  │                   │  localhost:8000                  │
+│                  │  ◄──────────────  │                                  │
+│  • Intent picker │    JSON response  │  GET  /health                    │
+│  • User selector │                   │  POST /recommend      (full RAG) │
+│  • Metrics bar   │                   │  POST /recommend/fast (no RAG)   │
+│  • Policy notes  │                   │                                  │
+└──────────────────┘                   └──────────────────────────────────┘
+```
+
+### Endpoints
+
+| Method | Path | Description | Latency |
+|--------|------|-------------|---------|
+| `GET` | `/health` | Liveness check, model version, load status | <10 ms |
+| `POST` | `/recommend` | Full pipeline: two-tower → constraints → RAG policy → GPT-4o | ~25 s |
+| `POST` | `/recommend/fast` | Retrieval-only: two-tower → FAISS → top-k (no RAG) | ~50 ms |
+
+### Streamlit UI Features
+
+- **Sidebar:** User ID picker, intent presets (weekly restock, healthy snacks, party planning, etc.), top-K slider, RAG toggle
+- **Metrics bar:** Total time, retrieval time, constraint time, generation time
+- **Recommendations table:** Product name, aisle, department, score, inventory badge (🟢/🟡/🔴)
+- **Policy reasoning:** Expandable per-item policy notes from GPT-4o
+- **Substitutions & warnings:** OOS substitutions, low-stock alerts
+- **Raw JSON viewer:** Full API response for debugging
+
+### Demo Screenshot
+
+![Streamlit UI](assets/streamlit_demo.png)
+
+---
+
 ## Project Structure
 
 ```
@@ -289,6 +331,13 @@ instacart_recsys/
 │       ├── dept_frozen.md                  #   frozen department rules
 │       ├── dept_dairy_eggs.md              #   dairy & eggs department rules
 │       └── dept_snacks.md                  #   snacks & shelf-stable rules
+│
+├── api/                                    # FastAPI serving layer
+│   ├── __init__.py
+│   └── main.py                             # /health, /recommend, /recommend/fast
+│
+├── streamlit_app.py                        # Streamlit demo UI
+├── pyproject.toml                          # Editable install config
 │
 ├── scripts/
 │   ├── build_product_signals.py            # Generate product popularity/reorder signals
@@ -359,7 +408,20 @@ export DEEPEVAL_METRICS=true && python -m rag_agent.run_demo
 
 Outputs written to `rag_agent/demo_outputs.jsonl`.
 
-### 6. Experiment tracking
+### 6. Start the API server
+
+```bash
+pip install -e .   # one-time: makes src/api/rag_agent importable
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+### 7. Launch the Streamlit UI
+
+```bash
+streamlit run streamlit_app.py   # open http://localhost:8501
+```
+
+### 8. Experiment tracking
 
 ```bash
 mlflow ui   # open http://localhost:5000
@@ -391,5 +453,6 @@ mlflow ui   # open http://localhost:5000
 | **Orchestration** | LangGraph (state machine), LangChain |
 | **LLM** | OpenAI GPT-4o / GPT-4o-mini |
 | **Evaluation** | DeepEval (Faithfulness, Hallucination, Contextual Relevancy, GEval) |
+| **Serving** | FastAPI, uvicorn, Streamlit |
 | **Tracking** | MLflow |
-| **Language** | Python 3.11 |
+| **Language** | Python 3.14 |
