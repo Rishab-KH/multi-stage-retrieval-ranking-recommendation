@@ -64,30 +64,33 @@ A production-grade grocery recommendation platform combining a **two-tower neura
 ### Two-Tower Model
 
 ```
-     ┌────────────────┐        ┌─────────────────────-┐
-     │  USER TOWER    │        │    ITEM TOWER        │
-     │                │        │                      │
-     │  user_id       │        │  item_id             │
-     │     │          │        │  aisle_id ──┐        │
-     │  Embed(128)    │        │  dept_id  ──┤        │
-     │     │          │        │             ▼        │
-     │  Linear(128→256)        │  Embed concat        │
-     │  ReLU          │        │  (128+32+16 = 176)   │
-     │  Dropout(0.1)  │        │  Linear(176→256)     │
-     │  Linear(256→128)        │  ReLU                │
-     │     │          │        │  Dropout(0.1)        │
-     │  L2-Norm       │        │  Linear(256→128)     │
-     └───────┬────────┘        │  L2-Norm             │
-             │                 └──────────┬───────────┘
-             └────────────┬───────────────┘
-                          ▼
-               InfoNCE Loss (NT-Xent)
-               · In-batch negatives
-               · Hard negative mining
-               · Popularity debiasing
+     ┌──────────────────────┐        ┌──────────────────────────────┐
+     │  USER TOWER           │        │  ITEM TOWER (content-aware)  │
+     │                       │        │                              │
+     │  user_id              │        │  item_id + aisle_id + dept_id│
+     │     │                 │        │     │                        │
+     │  Embed(128)           │        │  Embed concat                │
+     │     │                 │        │  (128 + 32 + 16 = 176)       │
+     │  Linear(128→256)      │        │  Linear(176→256)             │
+     │  LayerNorm → GELU     │        │  LayerNorm → GELU            │
+     │  Dropout(0.15)        │        │  Dropout(0.15)               │
+     │  Linear(256→256)      │        │  Linear(256→256)             │
+     │  LayerNorm → GELU     │        │  LayerNorm → GELU            │
+     │  Dropout(0.1)         │        │  Dropout(0.1)                │
+     │  Linear(256→128)      │        │  Linear(256→128)             │
+     │     │                 │        │     │                        │
+     │  + residual (identity)│        │  + residual (linear proj)    │
+     │  L2-Norm              │        │  L2-Norm                     │
+     └──────────┬────────────┘        └──────────────┬───────────────┘
+                └────────────────┬────────────────────┘
+                                 ▼
+                      InfoNCE Loss (NT-Xent)
+                      · In-batch negatives
+                      · Hard negative mining (35% sample)
+                      · Popularity debiasing
 ```
 
-**Training:** Temporal split (last order = test, second-to-last = val, rest = train). InfoNCE with temperature 0.07, hard negatives mined per-epoch on 25% user sample, popularity debiasing via `log(q_j)` correction.
+**Training:** Temporal split (last order = test, second-to-last = val, rest = train). InfoNCE with temperature 0.07, hard negatives mined per-epoch on 35% user sample, popularity debiasing via `log(q_j)` correction.
 
 ### Retrieval → Reranking
 
@@ -123,10 +126,10 @@ Query (user intent + departments)
    ├── Dense: FAISS (text-embedding-3-small)  ──► top-80
    └── Sparse: BM25 (keyword-boosted)         ──► top-80
         └── Reciprocal Rank Fusion (RRF)      ──► top-30
-             └── Cohere Reranker              ──► top-5
+             └── Cohere Reranker              ──► top-6
 ```
 
-- **Index:** 10 policy Markdown files → 72 overlapping chunks (900 chars, 450 overlap)
+- **Index:** 10 policy Markdown files → semantic section-chunked (≤ 1200 chars per chunk, split at `##` headers with paragraph-level fallback)
 - **Keyword boosting:** BM25 queries augmented with domain terms (promotion, substitution, organic, bulk, etc.)
 - **Retrieval confidence threshold:** Low-confidence retrievals are flagged
 
@@ -248,13 +251,18 @@ All results are reported on a held-out test set of 206,209 users.
 | **Residual connections** | User tower: `x + tower(x)`; Item tower: linear projection residual for dimension mismatch | Preserves embedding identity, prevents gradient degradation in deeper towers |
 | **Hard-neg mining** | Increased mining sample fraction from 15%→35% of training users each epoch | Richer adversarial signal, better separation of near-miss items |
 
-### RAG Agent Metrics (Latest Run)
+### RAG Agent Metrics (Latest Run — 7 Demo Users)
 
-| User | Intent | Hallucination ↓ | Faithfulness ↑ | Retrieval Quality ↑ | Compliance Risk ↓ |
-|---|---|---:|---:|---:|---:|
-| 6 | Fast delivery + perishables | 0.80 | 1.00 | 0.43 | 0.28 |
-| 2 | Bulk staples + promo | 1.00 | 1.00 | 0.23 | 0.68 |
-| 10 | Substitutions + organic | 0.60 | 0.87 | 0.70 | 0.51 |
+| User | Intent | Faithfulness ↑ | Hallucination ↓ | Context Recall ↑ | Compliance Risk ↓ | Cost |
+|---:|---|---:|---:|---:|---:|---:|
+| 6 | Fast delivery + perishables | 1.00 | 0.33 | 0.85 | 0.28 | $0.042 |
+| 2 | Bulk staples + promo | 0.80 | 0.83 | 0.78 | 0.48 | $0.043 |
+| 10 | Substitutions + organic | 0.95 | 0.70 | 0.81 | 0.42 | $0.038 |
+| 1 | Snack variety + refund | 1.00 | 0.40 | 0.77 | 0.44 | $0.041 |
+| 17 | Frozen meal + cold chain | 1.00 | 0.33 | 0.99 | 0.31 | $0.039 |
+| 4 | Household restock + promo | 0.90 | 0.83 | 0.74 | 0.59 | $0.038 |
+| 9 | Dairy + substitution flexibility | 0.83 | 0.17 | 0.84 | 0.27 | $0.042 |
+| | **Average** | **0.93** | **0.51** | **0.83** | **0.40** | **$0.040** |
 
 ---
 
@@ -318,7 +326,7 @@ instacart_recsys/
 │   ├── constraints.py                      # Inventory constraint enforcement
 │   ├── policy_router.py                    # Intent → relevant policy document routing
 │   ├── config.py                           # Agent configuration
-│   ├── run_demo.py                         # Demo runner (3 user scenarios)
+│   ├── run_demo.py                         # Demo runner (7 user scenarios)
 │   ├── demo_outputs.jsonl                  # Pipeline outputs + metrics
 │   └── policies/                           # 10 policy Markdown documents
 │       ├── substitutions.md                #   substitution hierarchy & rules
